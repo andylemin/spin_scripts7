@@ -1,16 +1,23 @@
 #!/usr/local/bin/bash
 # spincheck.sh, logs fan and temperature data
-VERSION="2018-01-01"
+VERSION="2020-06-17"
 # Run as superuser. See notes at end.
 
 # Creates logfile and sends all stdout and stderr to the log, 
 # leaving the previous contents in place. If you want to append to existing log, 
 # add '-a' to the tee command.
-# Change to your desired log location/name:
-LOG=/mnt/MyPool/MyDataSet/MyDirectory/spincheck.log
+# Change to your desired log location/name: 
+# LOG=/mnt/MyPool/MyDataSet/MyDirectory/spincheck.log
+LOG=/var/log/spincheck.log
 exec > >(tee -i $LOG) 2>&1
 
 SP=33.57	#  Setpoint mean drive temp (C), for information only
+
+# Path to ipmitool.  If you're doing VM 
+# you may need to add (after first quote) the following to 
+# remotely execute commands.
+#  -H <hostname/ip> -U <username> -P <password> 
+IPMITOOL=/usr/local/bin/ipmitool
 
 ##############################################
 # function get_disk_name
@@ -114,8 +121,15 @@ function DRIVES_check {
       TEMP=""
       # Update temperatures each drive; spinners only
       if [ "$STATUS" == "*" ] ; then
-         # Taking 10th space-delimited field for WD, Seagate, Toshiba, Hitachi
-         TEMP=$( cat /var/tempfile | grep "Temperature_Celsius" | awk '{print $10}')
+         # Taking 10th space-delimited field for most SATA:
+         if grep -Fq "Temperature_Celsius" /var/tempfile ; then
+         	TEMP=$( cat /var/tempfile | grep "Temperature_Celsius" | awk '{print $10}')
+         # Else assume SAS, their output is:
+         #     Transport protocol: SAS (SPL-3) . . .
+         #     Current Drive Temperature: 45 C
+         else
+         	TEMP=$( cat /var/tempfile | grep "Drive Temperature" | awk '{print $4}')
+         fi
          let "Tsum += $TEMP"
          if [[ $TEMP > $Tmax ]]; then Tmax=$TEMP; fi;
          let "i += 1"
@@ -129,21 +143,23 @@ function DRIVES_check {
 # All this happens only at the beginning
 # Initializing values, list of drives, print header
 #####################################################
-# Get number of CPU cores to check for temperature
-# -1 because numbering starts at 0
-CORES=$(($(sysctl -n hw.ncpu)-1))
+
+# Check if CPU Temp is available via sysctl (will likely fail in a VM)
+CPU_TEMP_SYSCTL=$(($(sysctl -a | grep dev.cpu.0.temperature | wc -l) > 0))
+if [[ $CPU_TEMP_SYSCTL == 1 ]]; then
+	CORES=$(($(sysctl -n hw.ncpu)-1))
+fi
 
 echo "How many whole minutes do you want between spin checks?"
 read T
 SEC=$(bc <<< "$T*60")			# bc is a calculator
-IPMITOOL=/usr/local/bin/ipmitool
 # Get list of drives
 DEVLIST1=$(/sbin/camcontrol devlist)
-# Remove lines with flash drives or SSD; edit as needed
+# Remove lines with non-spinning devices; edit as needed
 # You could use another strategy, e.g., find something in the camcontrol devlist 
 # output that is unique to the drives you want, for instance only WDC drives:
 # if [[ $LINE != *"WDC"* ]] . . .
-DEVLIST="$(echo "$DEVLIST1"|sed '/KINGSTON/d;/ADATA/d;/SanDisk/d;/OCZ/d;/LSI/d;/INTEL/d;/TDKMedia/d;/SSD/d')"
+DEVLIST="$(echo "$DEVLIST1"|sed '/KINGSTON/d;/ADATA/d;/SanDisk/d;/OCZ/d;/LSI/d;/EXP/d;/INTEL/d;/TDKMedia/d;/SSD/d;/VMware/d;/Enclosure/d;/Card/d;/Flash/d')"
 DEVCOUNT=$(echo "$DEVLIST" | wc -l)
 printf "\n%s\n%s\n%s\n" "NOTE ABOUT DUTY CYCLE (Fan%0 and Fan%1):" \
 "Some boards apparently report incorrect duty cycle, and can" \
@@ -181,16 +197,19 @@ while [ 1 ] ; do
 	if (( $R < $T )); then print_header; fi
 	Tmax=0; Tsum=0  # initialize drive temps for new loop through drives
     DRIVES_check
-#    CPU_TEMP=$(sysctl -a dev.cpu.0.temperature | awk -F ' ' '{print $2}' | awk -F '.' '{print$1}')
     
-   # Find hottest CPU core
-   MAX_CORE_TEMP=0
-   for CORE in $(seq 0 $CORES)
-   do
-       CORE_TEMP="$(sysctl -n dev.cpu.${CORE}.temperature | awk -F '.' '{print$1}')"
-       if [[ $CORE_TEMP -gt $MAX_CORE_TEMP ]]; then MAX_CORE_TEMP=$CORE_TEMP; fi
-   done
-   CPU_TEMP=$MAX_CORE_TEMP
+    if [[ $CPU_TEMP_SYSCTL == 1 ]]; then    
+       # Find hottest CPU core
+       MAX_CORE_TEMP=0
+       for CORE in $(seq 0 $CORES)
+       do
+           CORE_TEMP="$(sysctl -n dev.cpu.${CORE}.temperature | awk -F '.' '{print$1}')"
+           if [[ $CORE_TEMP -gt $MAX_CORE_TEMP ]]; then MAX_CORE_TEMP=$CORE_TEMP; fi
+       done
+       CPU_TEMP=$MAX_CORE_TEMP
+   else
+       CPU_TEMP=$($IPMITOOL sensor get "CPU Temp" | awk '/Sensor Reading/ {print $4}')
+   fi
 
    # Print data.  If a fan doesn't exist, RPM value will be null.  These expressions 
    # substitute a value "---" if null so printing is not messed up.  Duty cycle may be 
