@@ -1,146 +1,119 @@
 #!/usr/local/bin/bash
-# spintest.sh for measuring DUTY-RPM relationship of fans.
-VERSION="2020-06-17"
-# Run as superuser. See notes at end.
 
-##############################################
-#
-#  Settings
-#
-##############################################
+# Step both fan zones from DUTY_START down to DUTY_STOP, logging every fan's RPM at each step, to
+# find the RPM/duty relation and stall point of each fan. Run as superuser with no fan control
+# script running.
+VERSION="2026-10-17"
 
-#################  LOG SETTINGS ################
-# Create logfile and sends all stdout and stderr to the log, as well as to the console.
-LOG=/var/log/spintest.log  # Change to your desired log location/name
-exec > >(tee -i $LOG) 2>&1
+#################  SETTINGS  ################
 
-#################  IPMITOOL SETTING ################
-# Path to ipmitool.  If you're doing VM 
-# you may need to add (after first quote) the following to 
-# remotely execute commands.
-#  -H <hostname/ip> -U <username> -P <password> 
+LOG=/var/log/spintest.log
+# 1: log file and console; 0: log file only.
+LOG_CONSOLE=1
+
+# Add " -H <host> -U <user> -P <password>" inside the quotes to drive a remote BMC.
 IPMITOOL="/usr/local/bin/ipmitool"
 
-############################################################
-# function print_header
-# Called after user says they are ready
-############################################################
+# Duty cycle (%) sweep, from DUTY_START down to DUTY_STOP in steps of 10. Fans may stall near
+# the bottom; raise DUTY_STOP if yours do.
+DUTY_START=100
+DUTY_STOP=20
 
-function print_header {
+#############################################
+
+DIR=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
+# shellcheck source=spincommon.sh
+source "$DIR/spincommon.sh" || { echo "cannot read $DIR/spincommon.sh" >&2; exit 1; }
+setup_logging
+require_settings IPMITOOL DUTY_START DUTY_STOP
+require_tools IPMITOOL
+if [[ ! $DUTY_START =~ ^[0-9]+$ || ! $DUTY_STOP =~ ^[0-9]+$ || $DUTY_START -gt 100 || $DUTY_STOP -gt $DUTY_START || $DUTY_STOP -lt 10 ]]; then
+   echo "DUTY_START and DUTY_STOP must be whole numbers with 100 >= DUTY_START >= DUTY_STOP >= 10"
+   exit 1
+fi
+
+# Table header with a timestamp; printed before and after the confirmation.
+print_header() {
    echo
-   DATE=$(date +"%A, %b %d, %H:%M:%S")
-   echo "$DATE"
-
-   printf "%44s %29s \n" $SPACES "___Duty%___" "Curr_RPM____________________" 
-
-   printf "%28s %9s %5s %5s %5s %5s %5s %5s \n" "MODE" "Zone0" "Zone1" "FANA" "FAN1" "FAN2" "FAN3" "FAN4"
+   date +"%A, %b %d, %H:%M:%S"
+   printf "%44s %41s \n" "___Duty%___" "Curr_RPM_________________________________"
+   printf "%28s %9s %5s %5s %5s %5s %5s %5s %5s %5s \n" "MODE" "Zone0" "Zone1" "FANA" "FANB" "FAN1" "FAN2" "FAN3" "FAN4" "FAN5"
 }
 
-#################################################
-# function read_fan_data
-#################################################
-function read_fan_data {
-
-   # Read duty cycles, convert to decimal.
-   # Some boards provide inaccurate duty cycle.  In that case,
-   # comment out these 4 lines and we assume it is what we set.
-   DUTY_0=$($IPMITOOL raw 0x30 0x70 0x66 0 0) # in hex with leading space
-   DUTY_0=$((0x$(echo $DUTY_0)))  # strip leading space and decimalize
-   DUTY_1=$($IPMITOOL raw 0x30 0x70 0x66 0 1)
-   DUTY_1=$((0x$(echo $DUTY_1)))
-
-   # Read fan mode, convert to decimal, get text equivalent.
-   MODE=$($IPMITOOL raw 0x30 0x45 0) # in hex with leading space
-   MODE=$((0x$(echo $MODE)))  # strip leading space and decimalize
-   # Text for mode
-   case $MODE in
-      0) MODEt="Standard" ;;
-      1) MODEt="Full" ;;
-      2) MODEt="Optimal" ;;
-      4) MODEt="HeavyIO" ;;
-   esac
-
-   # Get reported fan speed in RPM from sensor data repository.
-   # Takes the pertinent FAN line, then 3 to 5 consecutive digits
-   SDR=$($IPMITOOL sdr)
-   FAN1=$(echo "$SDR" | grep "FAN1" | grep -Eo '[0-9]{3,5}')
-   FAN2=$(echo "$SDR" | grep "FAN2" | grep -Eo '[0-9]{3,5}')
-   FAN3=$(echo "$SDR" | grep "FAN3" | grep -Eo '[0-9]{3,5}')
-   FAN4=$(echo "$SDR" | grep "FAN4" | grep -Eo '[0-9]{3,5}')
-   FANA=$(echo "$SDR" | grep "FANA" | grep -Eo '[0-9]{3,5}')
+# Duties of both zones, fan mode and fan RPMs; a failed read leaves the value empty.
+read_fan_data() {
+   DUTY_0=$(read_duty 0)
+   DUTY_1=$(read_duty 1)
+   read_mode
+   read_fan_rpms
 }
 
-##############################################
-# function print_line
-# 
-##############################################
-function print_line {
-   printf "%-23s %-8s %5s %5s %5s %5s %5s %5s %5s \n"  "$COND" $MODEt "${DUTY_0:----}" "${DUTY_1:----}" "${FANA:----}" "${FAN1:----}" "${FAN2:----}" "${FAN3:----}" "${FAN4:----}" 
-
+# One table row labelled COND: mode, both duties, the seven fan RPMs.
+print_line() {
+   printf "%-23s %-8s %5s %5s %5s %5s %5s %5s %5s %5s %5s \n" "$COND" "$MODEt" "${DUTY_0:----}" "${DUTY_1:----}" "${FANA:----}" "${FANB:----}" "${FAN1:----}" "${FAN2:----}" "${FAN3:----}" "${FAN4:----}" "${FAN5:----}"
 }
 
 #####################################################
 # Main section
 #####################################################
-read_fan_data  # Get before script changes things
+read_fan_data
 MODEorig=$MODE
+DUTY_0orig=$DUTY_0
+DUTY_1orig=$DUTY_1
 
 echo
-echo "Script to determine fan RPMs associated with varying duty cycles."
-echo "Duty will be varied from 100% down in steps of 10."
-echo "After setting duty, we wait 5 seconds for equilibration"
-echo "before reading the fans.  Some points:"
-echo
-echo "1. Set the log path in the script before beginning."
-echo "2. There should be no fan control scripts running."
-echo "3. At very high and especially low fan speeds, the BMC may take "
-echo "   over and change the duty.  You can:"
-echo "     - ignore it,"
-echo "     - adjust fan thresholds before testing, or"
-echo "     - edit the script so it starts and/or ends at different values"
-echo "       (see comment before while loop for instructions)."
+echo "Script to determine fan RPMs associated with varying duty cycles (version $VERSION)."
+echo "Duty will be varied from $DUTY_START% down to $DUTY_STOP% in steps of 10, ending at $DUTY_STOP%"
+echo "(DUTY_START and DUTY_STOP in the settings at the top of the script)."
+echo "After setting duty, we wait 5 seconds for equilibration before reading the fans."
+echo "There should be no fan control scripts running."
+echo "At very high and especially low fan speeds, the BMC may take over and change the duty:"
+echo "ignore it, or adjust the fan thresholds before testing."
+echo "Logging to $LOG."
 
-# Print before test
 print_header
 COND="Conditions before test"
 print_line
 
 echo
 echo "Are you ready to begin? (y/n)"
-read START
-if [ $START != "y" ]; then
+if ! read -r START || [ "$START" != "y" ]; then
+   echo "Not started."
    exit
 fi
 
 print_header
 
-# Set mode to 'Full' to avoid BMC changing duty cycle
-# Need to wait a tick or it may not get next command
-# "echo -n" to avoid annoying newline generated in log
-echo -n `$IPMITOOL raw 0x30 0x45 1 1`
+# Full mode keeps the BMC from changing the duty; it needs a moment before the next command.
+set_mode 1
 sleep 1
 
-# This loop starts at 100% duty cycle and drops by
-# 10 points each step, reading fans each stop.
-# To limit the low end of duty cycle test,
-# edit the number after '-gt' in the following line . E.g., if you 
-# don't want your fans to go below 20, any number from 
-# 10 to 19 will stop it at 20.
-
-i=100
-
-while [ $i -gt 10 ]; do
-   DUTY_0=$i; DUTY_1=$i
-   echo -n `$IPMITOOL raw 0x30 0x70 0x66 1 0 $i`
+# The last step is clamped so DUTY_STOP itself is measured.
+i=$DUTY_START
+while :; do
+   set_duty 0 "$i"
    sleep 1
-   echo -n `$IPMITOOL raw 0x30 0x70 0x66 1 1 $i`
+   set_duty 1 "$i"
    sleep 5
    read_fan_data
    COND="Duty cycle $i%"
    print_line
-   let i=i-10
+   (( i <= DUTY_STOP )) && break
+   i=$(( i - 10 ))
+   (( i < DUTY_STOP )) && i=$DUTY_STOP
 done
 
-# Leave it in previous mode and walk away
-echo -n `$IPMITOOL raw 0x30 0x45 1 $MODEorig`
- 
+# Restore the pre-test duties and mode.
+if [ -n "$DUTY_0orig" ]; then
+   set_duty 0 "$DUTY_0orig"
+   sleep 1
+fi
+if [ -n "$DUTY_1orig" ]; then
+   set_duty 1 "$DUTY_1orig"
+   sleep 1
+fi
+set_mode "${MODEorig:-1}"
+sleep 5
+read_fan_data
+COND="After test (restored)"
+print_line
