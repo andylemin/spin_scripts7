@@ -3,23 +3,31 @@
 # Fan control for Supermicro boards with one fan zone: the zone runs at the higher of the drive
 # demand (a PD controller holding the mean drive temperature at a setpoint) and the CPU demand.
 # Run as superuser; settings in spinpid.config.
-VERSION="2026-10-17"
+VERSION="2026-10-20"
 
 DIR=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
 # shellcheck source=spinpid.config
 source "$DIR/spinpid.config" || { echo "cannot read $DIR/spinpid.config" >&2; exit 1; }
 # shellcheck source=spincommon.sh
 source "$DIR/spincommon.sh" || { echo "cannot read $DIR/spincommon.sh" >&2; exit 1; }
-setup_logging
 
+# Settings and the drive list are checked before the log opens; a refusal is shown on the console
+# and appended to LOG.
 require_settings IPMITOOL SMARTCTL CAMCONTROL SP DRIVE_T Kp Kd DUTY_MIN DUTY_MAX \
    HOW_DUTY CPU_T CPU_REF CPU_SCALE
 require_defined DEVLIST_EXCLUDE CPU_TEMP_SENSOR
 require_tools IPMITOOL SMARTCTL CAMCONTROL
-if [[ ! $DRIVE_T =~ ^[1-9][0-9]*$ || ! $CPU_T =~ ^[1-9][0-9]*$ ]] || (( CPU_T > DRIVE_T * 60 )); then
-   echo "DRIVE_T and CPU_T must be whole numbers above 0 with CPU_T no longer than DRIVE_T minutes; check spinpid.config"
-   exit 1
-fi
+require_integers 1 1440 DRIVE_T
+require_integers 1 86400 CPU_T
+(( CPU_T <= DRIVE_T * 60 )) || fail "CPU_T must not be longer than DRIVE_T minutes; check spinpid.config"
+require_integers 0 100 DUTY_MIN DUTY_MAX
+(( DUTY_MIN <= DUTY_MAX )) || fail "DUTY_MIN must not be above DUTY_MAX; check spinpid.config"
+require_integers 0 1 HOW_DUTY
+require_integers 0 200 CPU_REF
+require_integers 1 100 CPU_SCALE
+require_numbers SP Kp Kd
+build_devlist
+setup_logging
 
 # Column header; printed at start and in the first DRIVE_T minutes of each quarter day.
 print_header() {
@@ -50,7 +58,8 @@ read_fan_data() {
 }
 
 # CPU demand from the CPU temperature; the zone gets the higher of CPU and drive demand. While the
-# drives are at least 1 C below the setpoint with PD < 0, the drive demand steps down by PD per cycle.
+# drives are more than 1 C below the setpoint with PD < 0, the drive demand is re-derived each cycle
+# as the zone's current duty plus PD, so the zone also comes back down after a CPU burst.
 CPU_check_adjust() {
    local new prev
    NEXT_CPU=$(( NEXT_CPU + CPU_T ))
@@ -80,9 +89,11 @@ CPU_check_adjust() {
    sleep_until "$NEXT_CPU" "$CPU_T"
 }
 
-# Drive row and PD terms; the drive demand is applied when it is at least the CPU demand.
+# Drive row and PD terms; the drive demand is applied when it is at least the CPU demand. With no
+# temperature at all the demand is the minimum when every drive sleeps, but is left as it was when
+# any drive is awake without one: it may be hot.
 DRIVES_check_adjust() {
-   local now dt
+   local now dt unread=0
    echo
    print_time
    Tmax=0; Tsum=0
@@ -94,6 +105,8 @@ DRIVES_check_adjust() {
          Tsum=$(( Tsum + TEMP ))
          (( TEMP > Tmax )) && Tmax=$TEMP
          i=$(( i + 1 ))
+      elif [ "$STATUS" != "_" ]; then
+         unread=$(( unread + 1 ))
       fi
       printf "%s%-2s  " "$STATUS" "${TEMP:---}"
    done <<< "$DEVLIST"
@@ -101,14 +114,21 @@ DRIVES_check_adjust() {
    now=$SECONDS
    if [ "$i" -eq 0 ]; then
       Tmean=""; Tmax=""; P=""; D=""; ERRc=""; PD=0
-      DUTY_DRIVE=$DUTY_MIN
+      if (( unread == 0 )); then
+         DUTY_DRIVE=$DUTY_MIN
+         BLIND_NOTED=0
+      elif [ "$BLIND_NOTED" != 1 ]; then
+         printf "[no drive temperature; keeping drive demand %s] " "$DUTY_DRIVE"
+         BLIND_NOTED=1
+      fi
    else
+      BLIND_NOTED=0
       Tmean=$(bc <<< "scale=2; $Tsum / $i")
       ERRp=$ERRc
       ERRc=$(bc <<< "scale=3; ($Tmean - $SP) / 1")
       P=$(bc <<< "scale=3; ($Kp * $ERRc) / 1")
-      # No earlier error on the first check or after an all-standby check. The measured interval is
-      # dropped for the nominal one when a clock step makes it implausible.
+      # No earlier error on the first check or after a check with no drive temperature. The measured
+      # interval is dropped for the nominal one when a clock step makes it implausible.
       if [ -z "$ERRp" ]; then
          D=0
       else
@@ -176,8 +196,6 @@ FIRST_TIME=1
 ERRc=""
 LAST_CHECK=$SECONDS
 
-build_devlist
-
 read_fan_data
 
 # Full mode keeps the BMC from changing the duty; it needs a moment before the next command.
@@ -196,7 +214,7 @@ DUTY_DRIVE=$DUTY_CURR
 
 drive_health_warning
 
-printf "\n%s %51s %s \n" "Key to drive status symbols:  * spinning;  _ standby;  ? unknown" "Version" "$VERSION"
+printf "\n%s %18s %s \n" "Key to drive status symbols:  * spinning (*-- without a temperature);  _ standby;  ? not readable" "Version" "$VERSION"
 print_header
 CPU_check_adjust
 
@@ -211,14 +229,12 @@ while true ; do
 
    printf "%6s %6s %6.6s %3s %-6s %2d/%-5d " "${ERRc:----}" "${P:----}" "${D:----}" "${CPU_TEMP:----}" "$DRIVER" "$DUTY_PREV" "$DUTY_CURR"
 
-   if [[ $FIRST_TIME -eq 0 ]]; then
-      # let the fan settle on the new duty before reading it
-      sleep 5
-      read_fan_data
-   fi
+   # let the fan settle on the new duty before reading it
+   sleep 5
+   read_fan_data
    FIRST_TIME=0
 
-   printf "%-8s %4s " "$MODEt" "${RPM:----}"
+   printf "%-8s %4s " "${MODEt:----}" "${RPM:----}"
 
    NEXT_CPU=$SECONDS
    i=0

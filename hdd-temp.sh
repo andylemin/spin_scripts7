@@ -47,5 +47,5 @@ for drive in $(sysctl -n kern.disks | awk '{ for (i = NF; i != 0; i--) print $i 
          temp=$(printf '%s\n' "$out" | parse_temp)
          ;;
    esac
-   echo "$drive ${temp:+${temp}C}"
+   echo "$drive ${temp:-?}${temp:+C}"
 done

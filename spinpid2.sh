@@ -3,33 +3,38 @@
 # Fan control for Supermicro boards with two fan zones: a PD controller holds the mean drive
 # temperature at a setpoint with the peripheral zone; the CPU zone follows the CPU temperature.
 # Run as superuser; settings in spinpid2.config.
-VERSION="2026-10-17"
+VERSION="2026-10-20"
 
 DIR=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
 # shellcheck source=spinpid2.config
 source "$DIR/spinpid2.config" || { echo "cannot read $DIR/spinpid2.config" >&2; exit 1; }
 # shellcheck source=spincommon.sh
 source "$DIR/spincommon.sh" || { echo "cannot read $DIR/spincommon.sh" >&2; exit 1; }
-setup_logging
 
+# Settings and the drive list are checked before the log opens; a refusal is shown on the console
+# and appended to LOG.
 require_settings IPMITOOL SMARTCTL CAMCONTROL CPU_LOG_YES CPU_LOG SP DRIVE_T Kp Kd \
    ZONE_CPU ZONE_PER DUTY_PER_MIN DUTY_PER_MAX DUTY_CPU_MIN DUTY_CPU_MAX \
    RPM_CPU_30 RPM_CPU_MAX RPM_PER_30 RPM_PER_MAX HOW_DUTY CPU_T CPU_REF CPU_SCALE
 require_defined DEVLIST_EXCLUDE CPU_TEMP_SENSOR
 require_tools IPMITOOL SMARTCTL CAMCONTROL
-if [[ ! $ZONE_CPU =~ ^[01]$ || ! $ZONE_PER =~ ^[01]$ || $ZONE_CPU == "$ZONE_PER" ]]; then
-   echo "ZONE_CPU and ZONE_PER must be 0 and 1, one each; check spinpid2.config"
-   exit 1
+require_integers 0 1 ZONE_CPU ZONE_PER HOW_DUTY CPU_LOG_YES
+[ "$ZONE_CPU" != "$ZONE_PER" ] || fail "ZONE_CPU and ZONE_PER must differ; check spinpid2.config"
+require_integers 1 1440 DRIVE_T
+require_integers 1 86400 CPU_T
+(( CPU_T <= DRIVE_T * 60 )) || fail "CPU_T must not be longer than DRIVE_T minutes; check spinpid2.config"
+require_integers 1 99999 RPM_CPU_30 RPM_CPU_MAX RPM_PER_30 RPM_PER_MAX
+(( RPM_CPU_30 <= RPM_CPU_MAX && RPM_PER_30 <= RPM_PER_MAX )) || fail "RPM_*_30 must not be above RPM_*_MAX; check spinpid2.config"
+require_integers 0 100 DUTY_PER_MIN DUTY_PER_MAX DUTY_CPU_MIN DUTY_CPU_MAX
+(( DUTY_PER_MIN <= DUTY_PER_MAX && DUTY_CPU_MIN <= DUTY_CPU_MAX )) || fail "DUTY_*_MIN must not be above DUTY_*_MAX; check spinpid2.config"
+require_integers 0 200 CPU_REF
+require_integers 1 100 CPU_SCALE
+require_numbers SP Kp Kd
+if [ "$CPU_LOG_YES" == 1 ]; then
+   ( : >> "$CPU_LOG" ) 2> /dev/null || fail "cannot write the CPU log $CPU_LOG; check CPU_LOG in spinpid2.config"
 fi
-if [[ ! $DRIVE_T =~ ^[1-9][0-9]*$ || ! $CPU_T =~ ^[1-9][0-9]*$ ]] || (( CPU_T > DRIVE_T * 60 )); then
-   echo "DRIVE_T and CPU_T must be whole numbers above 0 with CPU_T no longer than DRIVE_T minutes; check spinpid2.config"
-   exit 1
-fi
-if [[ ! $RPM_CPU_30 =~ ^[1-9][0-9]*$ || ! $RPM_CPU_MAX =~ ^[1-9][0-9]*$ || ! $RPM_PER_30 =~ ^[1-9][0-9]*$ || ! $RPM_PER_MAX =~ ^[1-9][0-9]*$ ]] ||
-   (( RPM_CPU_30 > RPM_CPU_MAX || RPM_PER_30 > RPM_PER_MAX )); then
-   echo "RPM_*_30 and RPM_*_MAX must be whole numbers above 0 with the 30 % value not above the 100 % value; check spinpid2.config"
-   exit 1
-fi
+build_devlist
+setup_logging
 
 # Column header; printed at start and in the first DRIVE_T minutes of each quarter day.
 print_header() {
@@ -78,7 +83,7 @@ CPU_check_adjust() {
    fi
    adjust_fans "$ZONE_CPU" "$DUTY_CPU" "$DUTY_CPU_LAST"
 
-   # Drives at least 1 C below the setpoint and PD < 0: step the PER duty down by PD each CPU cycle.
+   # Drives more than 1 C below the setpoint and PD < 0: step the PER duty down by PD each CPU cycle.
    if [[ -n $Tmean && PD -lt 0 && $(bc <<< "$Tmean < ($SP-1)") == 1 ]]; then
       DUTY_PER_LAST=$DUTY_PER
       DUTY_PER=$(constrain $(( DUTY_PER + PD )) "$DUTY_PER_MIN" "$DUTY_PER_MAX")
@@ -94,9 +99,10 @@ CPU_check_adjust() {
    declare -f -F Post_CPU_check_adjust > /dev/null && Post_CPU_check_adjust
 }
 
-# Drive row, PD terms and the PER zone duty.
+# Drive row, PD terms and the PER zone duty. With no temperature at all the duty is the minimum when
+# every drive sleeps, but is kept when any drive is awake without one: it may be hot.
 DRIVES_check_adjust() {
-   local now dt
+   local now dt unread=0
    Tmax=0; Tsum=0
    i=0
    while read -r LINE ; do
@@ -106,6 +112,8 @@ DRIVES_check_adjust() {
          Tsum=$(( Tsum + TEMP ))
          (( TEMP > Tmax )) && Tmax=$TEMP
          i=$(( i + 1 ))
+      elif [ "$STATUS" != "_" ]; then
+         unread=$(( unread + 1 ))
       fi
       printf "%s%-2s  " "$STATUS" "${TEMP:---}"
    done <<< "$DEVLIST"
@@ -114,15 +122,22 @@ DRIVES_check_adjust() {
    now=$SECONDS
    if [ "$i" -eq 0 ]; then
       Tmean=""; Tmax=""; P=""; D=""; ERRc=""; PD=0
-      DUTY_PER=$DUTY_PER_MIN
+      if (( unread == 0 )); then
+         DUTY_PER=$DUTY_PER_MIN
+         BLIND_NOTED=0
+      elif [ "$BLIND_NOTED" != 1 ]; then
+         printf "[no drive temperature; keeping PER duty %s] " "$DUTY_PER"
+         BLIND_NOTED=1
+      fi
    else
+      BLIND_NOTED=0
       Tmean=$(bc <<< "scale=2; $Tsum / $i")
       ERRp=$ERRc
       ERRc=$(bc <<< "scale=2; ($Tmean - $SP) / 1")
       P=$(bc <<< "scale=3; ($Kp * $ERRc) / 1")
-      # No earlier error on the first check or after an all-standby check. The measured interval is
-      # dropped for the nominal one when a clock step makes it implausible; a BMC reset (~150 s)
-      # stays within the bound.
+      # No earlier error on the first check or after a check with no drive temperature. The measured
+      # interval is dropped for the nominal one when a clock step makes it implausible; a BMC reset (up to about
+      # four minutes) stays within the bound.
       if [ -z "$ERRp" ]; then
          D=0
       else
@@ -145,8 +160,6 @@ DRIVES_check_adjust() {
    adjust_fans "$ZONE_PER" "$DUTY_PER" "$DUTY_PER_LAST"
 
    printf "^%-3s %5s" "${Tmax:---}" "${Tmean:----}"
-   # Config hook; may read Tmean, Tmax, ERRc, P, D, PD, DUTY_PER, FAN*, SDR.
-   declare -f -F Post_DRIVES_check_adjust > /dev/null && Post_DRIVES_check_adjust
 }
 
 # $1 zone, $2 duty, $3 last duty; sends when they differ or on the first call.
@@ -170,24 +183,62 @@ print_interim_CPU() {
    printf "%s%7s %5s %5d \n" "$(print_time)" "${rpm:----}" "${CPU_TEMP:----}" "$DUTY_CPU"
 }
 
-# A reference fan running fast at the minimum duty or slow at 95 %+ is a mismatch; the duty
-# compared is the one last requested. A fan without a reading is not checked.
-mismatch_test() {
-   local rpm
-   MISMATCH=0; MISMATCH_CPU=0; MISMATCH_PER=0
-   rpm=${!RPM_CPU}
+# $1 zone name, $2 reference fan, $3 requested duty, $4 minimum duty, $5 fast limit at the minimum,
+# $6 slow limit at 95 %+. True for a mismatch to escalate; END_$1 records the end that failed (MIN
+# or MAX) and PASSED_$1 whether the last reading followed the duty. A fan without a reading is noted
+# once and not checked. An end held after a BMC reset (HELDMIN_$1, HELDMAX_$1) is not escalated
+# again until the fan has followed the duty at that end; the other end is tested on its own.
+zone_mismatch() {
+   local rpm=${!2} noread=NOREAD_$1 end="" held
    if [ -z "$rpm" ]; then
-      printf "\n%s\n" "No RPM reading for $RPM_CPU; CPU zone not checked"
-   elif [[ (DUTY_CPU_SET -ge 95 && rpm -lt RPM_CPU_MAX) || (DUTY_CPU_SET -le DUTY_CPU_MIN && rpm -gt RPM_CPU_LOW) ]]; then
-      MISMATCH=1; MISMATCH_CPU=1
-      printf "\n%s\n" "Mismatch between CPU duty and RPM: duty $DUTY_CPU_SET, $RPM_CPU $rpm RPM (limits: below $RPM_CPU_MAX at 95 %+, above $RPM_CPU_LOW at $DUTY_CPU_MIN %)"
+      [ "${!noread}" == 1 ] || printf "\n%s\n" "No RPM reading for $2; $1 zone not checked"
+      printf -v "$noread" 1
+      return 1
    fi
-   rpm=${!RPM_PER}
-   if [ -z "$rpm" ]; then
-      printf "\n%s\n" "No RPM reading for $RPM_PER; PER zone not checked"
-   elif [[ (DUTY_PER_SET -ge 95 && rpm -lt RPM_PER_MAX) || (DUTY_PER_SET -le DUTY_PER_MIN && rpm -gt RPM_PER_LOW) ]]; then
+   printf -v "$noread" 0
+   if [[ ${3} -ge 95 && rpm -lt ${6} ]]; then
+      end=MAX
+   elif [[ ${3} -le ${4} && rpm -gt ${5} ]]; then
+      end=MIN
+   fi
+   if [ -n "$end" ]; then
+      printf -v "END_$1" '%s' "$end"
+      printf -v "PASSED_$1" 0
+      held=HELD${end}_$1
+      [ "${!held}" == 1 ] && return 1
+      printf "\n%s\n" "Mismatch between $1 duty and RPM: duty $3, $2 $rpm RPM (limits: below $6 at 95 %+, above $5 at $4 %)"
+      return 0
+   fi
+   printf -v "PASSED_$1" 1
+   [[ ${3} -ge 95 ]] && printf -v "HELDMAX_$1" 0
+   [[ ${3} -le ${4} ]] && printf -v "HELDMIN_$1" 0
+   return 1
+}
+
+# A reference fan running fast at the minimum duty or slow at 95 %+ is a mismatch; the duty
+# compared is the one last requested.
+mismatch_test() {
+   MISMATCH=0; MISMATCH_CPU=0; MISMATCH_PER=0
+   if zone_mismatch CPU "$RPM_CPU" "$DUTY_CPU_SET" "$DUTY_CPU_MIN" "$RPM_CPU_LOW" "$RPM_CPU_MAX"; then
+      MISMATCH=1; MISMATCH_CPU=1
+   fi
+   if zone_mismatch PER "$RPM_PER" "$DUTY_PER_SET" "$DUTY_PER_MIN" "$RPM_PER_LOW" "$RPM_PER_MAX"; then
       MISMATCH=1; MISMATCH_PER=1
-      printf "\n%s\n" "Mismatch between PER duty and RPM: duty $DUTY_PER_SET, $RPM_PER $rpm RPM (limits: below $RPM_PER_MAX at 95 %+, above $RPM_PER_LOW at $DUTY_PER_MIN %)"
+   fi
+}
+
+# $1 zone name, $2 reference fan, $3 1 when this zone's mismatch led to the reset. After the
+# escalation a zone still mismatched, or one that led to the reset and has not been seen following
+# the duty since, is held at the end that failed (see zone_mismatch), so the reset is not repeated
+# every drive cycle.
+hold_mismatch() {
+   local mismatch=MISMATCH_$1 passed=PASSED_$1 end=END_$1
+   if [ "${!mismatch}" == 1 ]; then
+      printf -v "HELD${!end}_$1" 1
+      printf "%s\n" "$1 mismatch persists after the BMC reset; not escalated again until $2 follows the duty. Check RPM_$1_30, RPM_$1_MAX and the BMC fan thresholds."
+   elif [ "$3" == 1 ] && [ "${!passed}" != 1 ]; then
+      printf -v "HELD${!end}_$1" 1
+      printf "%s\n" "$1 mismatch not seen cleared after the BMC reset ($2 has no reading); not escalated again until $2 follows the duty."
    fi
 }
 
@@ -197,24 +248,29 @@ force_set_fans() {
       FIRST_TIME=1
       DUTY_CPU=$DUTY_CPU_SET
       adjust_fans "$ZONE_CPU" "$DUTY_CPU" "$DUTY_CPU_LAST"
-      echo "Attempting to fix CPU mismatch  "
+      echo "Re-sending CPU duty $DUTY_CPU_SET"
       sleep 5
    fi
    if [ "$MISMATCH_PER" == 1 ]; then
       FIRST_TIME=1
       DUTY_PER=$DUTY_PER_SET
       adjust_fans "$ZONE_PER" "$DUTY_PER" "$DUTY_PER_LAST"
-      echo "Attempting to fix PER mismatch  "
+      echo "Re-sending PER duty $DUTY_PER_SET"
       sleep 5
    fi
 }
 
-# The reset puts both zones at the BMC default; the caller re-sends both requested duties.
+# The reset puts both zones at the BMC default; the caller re-sends both requested duties. A BMC
+# still booting after 120 s is polled for up to another 120 s before Full mode is set.
 reset_bmc() {
+   local i=0
    print_time
    echo -n "Resetting BMC after second attempt failed to fix mismatch -- "
    $IPMITOOL bmc reset cold
    sleep 120
+   until read_mode 2> /dev/null || (( i++ >= 12 )); do
+      sleep 10
+   done
    set_mode 1
    sleep 1
    read_mode
@@ -269,8 +325,6 @@ FIRST_TIME=1
 ERRc=""
 LAST_CHECK=$SECONDS
 
-build_devlist
-
 # Reference fan per zone, read through ${!RPM_CPU} / ${!RPM_PER}.
 if [[ ZONE_PER -eq 0 ]]; then
    RPM_PER=FAN1
@@ -288,23 +342,22 @@ if [[ MODE -ne 1 ]]; then
    sleep 1
 fi
 
-# Unknown duty (HOW_DUTY=0) or fans running fast: start at 50 %.
-if [[ ${!RPM_PER} -ge RPM_PER_MAX || -z ${DUTY_PER+x} ]]; then
-   DUTY_PER=$(constrain 50 "$DUTY_PER_MIN" "$DUTY_PER_MAX")
-   set_duty "$ZONE_PER" "$DUTY_PER"
-   sleep 1
-fi
-if [[ ${!RPM_CPU} -ge RPM_CPU_MAX || -z ${DUTY_CPU+x} ]]; then
-   DUTY_CPU=$(constrain 50 "$DUTY_CPU_MIN" "$DUTY_CPU_MAX")
-   set_duty "$ZONE_CPU" "$DUTY_CPU"
-   sleep 1
-fi
+# Both zones start at a duty this script has sent, so the mismatch test compares a request: 50 %
+# when the board's duty is unknown (HOW_DUTY=0) or the fans run fast, else the board's duty clamped.
+[[ ${!RPM_PER} -ge RPM_PER_MAX || -z ${DUTY_PER+x} ]] && DUTY_PER=50
+DUTY_PER=$(constrain "$DUTY_PER" "$DUTY_PER_MIN" "$DUTY_PER_MAX")
+set_duty "$ZONE_PER" "$DUTY_PER"
+sleep 1
+[[ ${!RPM_CPU} -ge RPM_CPU_MAX || -z ${DUTY_CPU+x} ]] && DUTY_CPU=50
+DUTY_CPU=$(constrain "$DUTY_CPU" "$DUTY_CPU_MIN" "$DUTY_CPU_MAX")
+set_duty "$ZONE_CPU" "$DUTY_CPU"
+sleep 1
 DUTY_CPU_SET=$DUTY_CPU
 DUTY_PER_SET=$DUTY_PER
 
 drive_health_warning
 
-printf "\n%s \n" "Key to drive status symbols:  * spinning;  _ standby;  ? unknown"
+printf "\n%s \n" "Key to drive status symbols:  * spinning (*-- without a temperature);  _ standby;  ? not readable"
 printf "%0s %s \n" "Version" "$VERSION"
 print_header
 
@@ -330,10 +383,25 @@ while true ; do
    sleep 5
    read_fan_data
 
-   printf "%7s %6s %6.6s %4s %-7s %3d %3d %5s %5s %5s %5s %5s %5s %5s" "${ERRc:----}" "${P:----}" "${D:----}" "${CPU_TEMP:----}" "$MODEt" "$DUTY_CPU" "$DUTY_PER" "${FANA:----}" "${FANB:----}" "${FAN1:----}" "${FAN2:----}" "${FAN3:----}" "${FAN4:----}" "${FAN5:----}"
+   printf "%7s %6s %6.6s %4s %-7s %3d %3d %5s %5s %5s %5s %5s %5s %5s" "${ERRc:----}" "${P:----}" "${D:----}" "${CPU_TEMP:----}" "${MODEt:----}" "$DUTY_CPU" "$DUTY_PER" "${FANA:----}" "${FANB:----}" "${FAN1:----}" "${FAN2:----}" "${FAN3:----}" "${FAN4:----}" "${FAN5:----}"
+   # Config hook; may read Tmean, Tmax, ERRc, P, D, PD, DUTY_PER, DUTY_CPU, CPU_TEMP, FAN*, SDR as logged in this row.
+   declare -f -F Post_DRIVES_check_adjust > /dev/null && Post_DRIVES_check_adjust
 
-   # Up to two attempts to re-send mismatched duties, then a BMC reset and a third attempt.
-   ATTEMPTS=0
+   # A BMC running in its own fan mode (back late from a reset, or restarted) is put back in Full
+   # mode with both duties re-sent before the test.
+   if [[ -n $MODE && MODE -ne 1 ]]; then
+      printf "\n%s\n" "Fan mode is $MODEt; restoring Full mode"
+      set_mode 1
+      sleep 1
+      MISMATCH_CPU=1; MISMATCH_PER=1
+      force_set_fans
+      read_fan_data
+   fi
+
+   # Two re-sends of a mismatched duty; if the second fails, a BMC reset with both zones re-sent,
+   # then a last re-send. The zones that caused the reset, and whether each was seen following the
+   # duty afterwards, are recorded for hold_mismatch.
+   ATTEMPTS=0; RESET_CPU=0; RESET_PER=0
    mismatch_test
    while [ "$MISMATCH" == 1 ]; do
       force_set_fans
@@ -341,6 +409,9 @@ while true ; do
       read_fan_data
       mismatch_test
       if [ "$ATTEMPTS" == 2 ] && [ "$MISMATCH" == 1 ]; then
+         RESET_CPU=$MISMATCH_CPU; RESET_PER=$MISMATCH_PER
+         # shellcheck disable=SC2034  # set by zone_mismatch and read in hold_mismatch by name
+         PASSED_CPU=0 PASSED_PER=0
          reset_bmc
          MISMATCH_CPU=1; MISMATCH_PER=1
          force_set_fans
@@ -349,6 +420,8 @@ while true ; do
       fi
       [ "$ATTEMPTS" == 3 ] && break
    done
+   hold_mismatch CPU "$RPM_CPU" "$RESET_CPU"
+   hold_mismatch PER "$RPM_PER" "$RESET_PER"
 
    NEXT_CPU=$SECONDS
    i=0

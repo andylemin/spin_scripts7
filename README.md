@@ -16,29 +16,29 @@ This fork adds support for boards with seven fan headers (FAN1-FAN5, FANA, FANB)
 | `spinpid2.sh` | Controller for boards with two fan zones (CPU/system and peripheral). Settings in `spinpid2.config`. |
 | `spinpid.sh` | Controller for boards with one fan zone; the zone runs at the higher of the drive and CPU demands. Settings in `spinpid.config`. |
 | `spincheck.sh` | Logs temperatures, fan RPMs, duty cycles and the fan mode at a fixed interval without controlling anything. Settings at the top of the script. |
-| `spintest.sh` | Steps both zones from 100 % duty down to 20 % and logs every fan's RPM at each step, then restores the previous duty and mode. Settings at the top of the script. |
+| `spintest.sh` | Steps both zones from 100 % duty down to 20 % and logs every fan's RPM at each step, then restores the previous mode and duties (it does not start unless it can read the mode and the zone 0 duty). Settings at the top of the script. |
 | `spincommon.sh` | Functions shared by the four scripts above. It is sourced, not run. |
 | `hdd-temp.sh` | Prints the temperature of every ATA, SCSI/SAS and NVMe disk without waking drives that are in standby. |
 
 ## Requirements
 
-- FreeBSD 13 or later (TrueNAS CORE) with `bash` 5 from ports on the PATH; the scripts start with `#!/usr/bin/env bash`.
+- FreeBSD 13 or later (TrueNAS CORE) with `bash` 5 from ports on the PATH; the bash scripts start with `#!/usr/bin/env bash`.
 - `ipmitool` (ports) with access to the board's BMC, `smartctl` from smartmontools, and `camcontrol` from the base system. `hdd-temp.sh` also uses `nvmecontrol`.
 - Root privileges.
-- A fan on header FAN1 and, for the dual-zone controller, on FANA: these are the reference fans whose RPM is checked against the duty.
+- A fan on header FAN1 and, for the dual-zone controller, on FANA. `spinpid2.sh` treats them as the reference fans whose RPM it checks against the duty it set; `spinpid.sh` reports FAN1's RPM and checks nothing.
 
 ## Installation
 
 1. Copy all the files into one directory, for example `/root/spinscripts`. The scripts find `spincommon.sh` and their `.config` next to themselves.
 2. The scripts are executable in the repository; run `chmod +x *.sh` if a copy lost the bits.
-3. Edit the `.config` file of the controller you will use (see Settings). A script stops at startup and names any setting that is missing, any tool path that does not resolve and any value that is out of range.
+3. Edit the `.config` file of the controller you will use (see Settings). A script checks its settings and the drive list before it opens the log; a stop is shown on the console and appended to the log file, naming any setting that is missing, any tool path that does not resolve, a log file it cannot write (a missing or unwritable log can only be reported on the console), an empty drive list and any value that is out of range (whole numbers are written without a leading zero).
 
 ## Before using the fan control scripts
 
 1. Run `spincheck.sh` for a day or so and look over its log to get a feel for your temperatures, duty cycles and RPMs under the BMC's own control.
 2. With two fan zones, decide which zone does what and connect the fans accordingly. Supermicro's convention is zone 0 for the numbered headers (FAN1, FAN2, ...) as CPU/system fans and zone 1 for the lettered headers (FANA, FANB) as peripheral fans. Zone 0 has more headers and there are usually more drive fans than CPU fans, so the shipped settings reverse this: `ZONE_PER=0`, `ZONE_CPU=1`. Either way FAN1 and FANA must be populated.
 3. Set the BMC's fan thresholds to the fans' specifications (Ericloewe's guide on the TrueNAS forum). Thresholds belong to headers, so re-check them after moving fans. See "My fans are revving up and down?" below.
-4. Run `spintest.sh` with no controller running. Its log gives each fan's RPM at every duty step; the controllers need the reference fans' RPM at 30 % and at 100 % (`RPM_*_30`, `RPM_*_MAX`) and the stall point of your slowest fan decides the minimum duty.
+4. Run `spintest.sh` with no controller running. Its log gives each fan's RPM at every duty step; `spinpid2.sh` needs the reference fans' RPM at 30 % and at 100 % (`RPM_*_30`, `RPM_*_MAX`), and the stall point of your slowest fan decides the minimum duty for either controller.
 5. Go through the settings and set them for your system.
 6. When first using a controller, watch its log (and the CPU log if you enable it) for a couple of full cycles.
 
@@ -69,7 +69,7 @@ Only in `spinpid2.config`:
 | `DUTY_PER_MIN`, `DUTY_PER_MAX`, `DUTY_CPU_MIN`, `DUTY_CPU_MAX` | Duty limits (%) per zone. |
 | `RPM_CPU_30`, `RPM_CPU_MAX`, `RPM_PER_30`, `RPM_PER_MAX` | RPM of the reference fans (FANA or FAN1) at 30 % and 100 % duty, from `spintest.sh`. |
 | `CPU_LOG_YES`, `CPU_LOG` | 1 writes a line per CPU cycle to `CPU_LOG` (reference CPU fan RPM, CPU temperature, CPU duty). It grows fast; turn it off after tuning. |
-| `Post_DRIVES_check_adjust`, `Post_CPU_check_adjust` | Optional functions defined in the config and run after each drive and CPU check, for example to feed Grafana. The variables they may read are listed above their calls in `spinpid2.sh`. |
+| `Post_DRIVES_check_adjust`, `Post_CPU_check_adjust` | Optional functions defined in the config and run after each drive row and CPU check, for example to feed Grafana. The variables they may read are listed in the config and above their calls in `spinpid2.sh`. |
 
 Only in `spinpid.config`: `DUTY_MIN` and `DUTY_MAX`, the duty limits of the single zone.
 
@@ -77,10 +77,10 @@ Only in `spinpid.config`: `DUTY_MIN` and `DUTY_MAX`, the duty limits of the sing
 
 ## How the controllers work
 
-- Every `DRIVE_T` minutes each drive is polled with `smartctl -n standby`, so sleeping drives are not woken; spinning drives contribute to the mean temperature. The PD terms give the new drive-zone duty, within the configured limits. D is 0 on the first check and after a check with every drive in standby, and it uses the measured interval between checks.
-- Every `CPU_T` seconds the CPU demand is set from the hottest core (or the IPMI sensor). While the drives are at least 1 C below the setpoint and the drive correction is negative, the drive zone also steps down by that correction between drive checks.
+- Every `DRIVE_T` minutes each drive is polled with `smartctl -n standby`, so sleeping drives are not woken; spinning drives contribute to the mean temperature. The PD terms give the new drive-zone duty, within the configured limits; with every drive in standby the drive zone runs at its minimum duty, and when no drive reports a temperature while any is awake the drive demand is left as it was (the drives may be hot) and the row notes it once per episode. D is 0 on the first check and after a check with no drive temperature, and it uses the measured interval between checks.
+- Every `CPU_T` seconds the CPU demand is set from the hottest core (or the IPMI sensor). While the drives are more than 1 C below the setpoint and the drive correction is negative, the drive zone also steps down by that correction between drive checks.
 - A failed duty read keeps the last duty and logs a note; an unreadable CPU temperature keeps the CPU duty and is logged once.
-- After each drive check `spinpid2.sh` compares the duty it requested with the reference fans' RPM: a fan running fast at the minimum duty, or slow at 95 % and above, is a mismatch. The duty is re-sent up to twice; if the mismatch persists the BMC is cold-reset, Full mode is restored and both zones are re-sent. The thresholds are printed in the settings banner at startup. A fan without an RPM reading is not checked.
+- After each drive check `spinpid2.sh` compares the duty it requested with the reference fans' RPM: a fan running fast at the minimum duty, or slow at 95 % and above, is a mismatch. The duty is re-sent up to twice; if the mismatch persists the BMC is cold-reset and given up to four minutes to answer, then Full mode is restored, both zones are re-sent and a last re-send of the mismatched duty is tried. A mismatch that survives the reset is logged once and not escalated again until that fan has followed the duty at the end that failed (the minimum, or 95 % and above); each end is held on its own, so a fan that fails at both ends gets one reset per end, and a wrong RPM setting cannot reset the BMC every cycle. A zone whose mismatch led to the reset and that has not been seen following the duty since is held the same way. A BMC found running in its own fan mode at a drive check is put back in Full mode and both duties are re-sent. The thresholds are printed in the settings banner at startup. A fan without an RPM reading is not checked; this is noted once.
 
 ## Start at boot
 
@@ -90,11 +90,13 @@ Install the `tmux` package and add this line with `crontab -e`, with your direct
 
 Attach with `tmux attach -t fanscript` to watch the console output; the log file has the same content. Stop the controller with `kill` or by killing the tmux session; it removes its scratch files on exit.
 
+The scripts find `bash` through the PATH. rc(8) runs `/etc/rc.local`, rc.d scripts and TrueNAS init scripts with a PATH that has no `/usr/local/bin`, so a start from there needs the interpreter spelled out: `/usr/local/bin/bash /root/spinscripts/spinpid2.sh`. cron's PATH includes `/usr/local/bin`.
+
 ## Logs
 
-Drive status symbols: `*` spinning with its temperature, `_` standby, `?` unknown (no reply or no temperature).
+Drive status symbols: `*` spinning with its temperature (`*--` when it reports none), `_` standby, `?` not readable (no reply, or a reply that is neither a reading nor standby).
 
-`spinpid2.sh` main log, one row per drive check: time, one cell per drive, `Tmax`, `Tmean`, `ERRc` (Tmean - SP), `P`, `D`, CPU temperature, fan mode, the new CPU and PER duties, and the RPM of FANA, FANB, FAN1-FAN5 read 5 s after the new duty was applied. `---` marks a value that is unavailable. Mismatch handling, duty-read failures and BMC resets are logged between rows.
+`spinpid2.sh` main log, one row per drive check: time, one cell per drive, `Tmax`, `Tmean`, `ERRc` (Tmean - SP), `P`, `D`, CPU temperature, fan mode, the new CPU and PER duties, and the RPM of FANA, FANB, FAN1-FAN5 read 5 s after the new duty was applied. `---` marks a value that was not available: not read, or not computed because no drive reported a temperature. Mismatch handling, fan-mode restores and BMC resets are logged between rows; a failed duty read, or a check with no drive temperature, is noted inside the row (during mismatch handling, between rows).
 
 `spinpid.sh` main log: time, drive cells, `Tmax`, `Tmean`, `ERRc`, `P`, `D`, CPU temperature, which demand set the duty (`Drives` or `CPU`), previous/new duty, fan mode, FAN1 RPM, then every interim duty set during the following CPU cycles.
 
@@ -149,11 +151,11 @@ ipmitool sensor thresh FAN5 lower 100 200 300
 
 ## Drive temperatures
 
-`hdd-temp.sh` prints one line per disk from `kern.disks`: the device name and its temperature (`ada0 40C`), `standby` for a drive that is asleep (it is not woken), or `?` when the device cannot be read. NVMe devices (`nvd*`, `nda*`) are read through their controller, mapped with `nvmecontrol devlist`.
+`hdd-temp.sh` prints one line per disk from `kern.disks`: the device name and its temperature (`ada0 40C`), `standby` for a drive that is asleep (it is not woken), or `?` when the device cannot be read or reports no temperature. NVMe devices (`nvd*`, `nda*`) are read through their controller, mapped with `nvmecontrol devlist`, and show its composite temperature; `cd*` devices are skipped.
 
 ## Upgrading from an older checkout
 
-The `.config` files are plain settings now; the logging redirection and the hook descriptions moved into the scripts. Compare your `.config` with the shipped one and add the new keys (`SMARTCTL`, `CAMCONTROL`, `LOG_CONSOLE`, `DEVLIST_EXCLUDE`, `CPU_TEMP_SENSOR`; `HOW_DUTY` and `DUTY_MAX` in `spinpid.config`). Copy `spincommon.sh` alongside the scripts. A script that finds a setting missing stops at startup and names it.
+The `.config` files are plain settings now; the logging redirection and the hook descriptions moved into the scripts. Compare your `.config` with the shipped one and add the new keys (`SMARTCTL`, `CAMCONTROL`, `LOG_CONSOLE`, `DEVLIST_EXCLUDE`, `CPU_TEMP_SENSOR`; `LOG`, `HOW_DUTY` and `DUTY_MAX` in `spinpid.config`). Copy `spincommon.sh` alongside the scripts. A script that finds a setting missing stops at startup and names it. Hooks may read only the variables listed in `spinpid2.config`; the globals `DUTY`, `ZONE`, `DUTY_LAST`, `RPM`, `TIME`, `CPU_TEMP_SYSCTL` and `CORES` of older releases are gone.
 
 ## Changes since the fork
 
@@ -161,7 +163,14 @@ Upstream on GitHub stopped at Glorious1's 2018 upload; his later releases were p
 
 ### 2026-10-20
 
-- The bash scripts start with `#!/usr/bin/env bash`, so they run wherever bash is on the PATH instead of requiring `/usr/local/bin/bash`.
+- The bash scripts start with `#!/usr/bin/env bash`, so they run wherever bash is on the PATH instead of requiring `/usr/local/bin/bash`. Starts from rc(8) need the full path to bash (see Start at boot).
+- A mismatch that survives the BMC reset is logged once and not escalated again until the fan has followed the duty at the end that failed (each end held on its own), instead of a cold reset every drive cycle; a zone whose mismatch led to the reset and was not seen following the duty afterwards is held the same way; a reference fan without a reading is noted once rather than every cycle; after a reset the BMC is given up to a further 120 s to answer before Full mode is restored, and a BMC found running in its own fan mode at a drive check is put back in Full mode with both duties re-sent.
+- When no drive reports a temperature while any is awake (unreadable drives, which may be hot), the drive demand is left as it was and the row notes it once per episode, instead of dropping to the minimum; every drive in standby still means the minimum.
+- The scripts run in the C locale, so a comma-decimal locale no longer breaks the PD arithmetic (day and month names in the headers are English); a log file that cannot be written stops the script at startup, as does an unwritable CPU log when it is enabled; every whole-number setting (intervals, zones, duty limits, RPM references, `HOW_DUTY`, `CPU_LOG_YES`, `LOG_CONSOLE`, `CPU_REF`, `CPU_SCALE`) is range-checked and must be written without a leading zero, and `SP`, `Kp` and `Kd` must be numbers; the checks and the drive list run before the log opens, and a refusal is shown on the console and, unless the log itself is the problem, appended to the log whatever `LOG_CONSOLE` says.
+- Fan RPMs are taken from the reading column, so 0 RPM counts as a reading; a failed fan-mode, RPM or smartctl read shows `---` or `?` (a failed duty read keeps the last duty, noted in the row) and the tool's error text is no longer spliced into the row (spincheck notes once each raw command that stops answering); spinpid.sh waits 5 s and re-reads before completing its first row; both zones start at a duty within the limits that the script has sent (two writes at startup); spintest restores the mode before the duties and does not start unless it can read the mode and the zone 0 duty.
+- The drive hook runs after the row is logged and sees that row's fan RPMs.
+- `hdd-temp.sh` prints `?` for a device that answers without a temperature.
+- README: the validation and reference-fan claims, the status key, the 1 C step rule, the all-standby duty, where duty-read notes appear and the upgrade key list match the code.
 
 ### 2026-10-17
 
@@ -180,6 +189,7 @@ spinpid2.sh
 - D is 0 on the first check and after a check with every drive in standby (no more startup spike), and divides by the measured interval; the CPU loop is paced to its deadline so forks and the CPU log no longer stretch the drive interval.
 - The CPU log shows the CPU duty (it showed the drive zone's duty whenever the drive-lowering branch ran) and reads its one sensor through an SDR cache instead of walking the whole repository every cycle.
 - Standby and unknown drives print `_--` and `?--` instead of `_0`; the bc parse errors logged every CPU cycle while all drives slept are gone; the 7-header columns are consistent across header, rows and reads.
+- Hooks may read the variables listed in `spinpid2.config`; the globals `DUTY`, `ZONE`, `DUTY_LAST`, `RPM`, `TIME`, `CPU_TEMP_SYSCTL` and `CORES` of the previous release no longer exist.
 
 spinpid.sh
 
@@ -192,7 +202,7 @@ spincheck.sh and spintest.sh
 
 hdd-temp.sh
 
-- Uses `smartctl -n standby` so sleeping drives are not woken, parses ATA, SAS and NVMe output correctly (SAS printed a bare `C`), maps NVMe devices through `nvmecontrol devlist`, and reports `standby` or `?`.
+- Uses `smartctl -n standby` so sleeping drives are not woken, parses ATA, SAS and NVMe output correctly (SAS printed a bare `C`), maps NVMe devices through `nvmecontrol devlist` and prints their composite temperature as one value (two were printed), skips `cd*` devices, and reports `standby` or `?`.
 
 Documentation and repository
 

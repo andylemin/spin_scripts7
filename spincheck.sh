@@ -2,7 +2,7 @@
 
 # Log drive temperatures, fan RPMs, duty cycles and the fan mode at a fixed interval without
 # controlling anything; one or two fan zones. Run as superuser.
-VERSION="2026-10-17"
+VERSION="2026-10-20"
 
 #################  SETTINGS  ################
 
@@ -37,14 +37,13 @@ if [ -t 0 ]; then
    read -r -p "How many whole minutes do you want between spin checks? [$T] " ANSWER
    [ -n "$ANSWER" ] && T=$ANSWER
 fi
-if [[ ! $T =~ ^[1-9][0-9]*$ ]]; then
-   echo "The interval must be a whole number of minutes above 0, not '$T'" >&2
-   exit 1
-fi
-setup_logging
+[[ $T =~ ^[1-9][0-9]{0,3}$ ]] || fail "The interval must be a whole number of minutes from 1 to 9999, not '$T'"
 require_settings IPMITOOL SMARTCTL CAMCONTROL SP
 require_defined DEVLIST_EXCLUDE CPU_TEMP_SENSOR
 require_tools IPMITOOL SMARTCTL CAMCONTROL
+require_numbers SP
+build_devlist
+setup_logging
 
 # Column header; printed at start and in the first T minutes of each quarter day.
 print_header() {
@@ -59,7 +58,6 @@ print_header() {
 }
 
 detect_cpu_temp_source
-build_devlist
 
 printf "\n%s\n%s\n%s\n" "NOTE ABOUT DUTY CYCLE (Fan%0 and Fan%1):" \
 "Some boards apparently report incorrect duty cycle, and can" \
@@ -67,7 +65,7 @@ printf "\n%s\n%s\n%s\n" "NOTE ABOUT DUTY CYCLE (Fan%0 and Fan%1):" \
 
 drive_health_warning
 
-printf "\n%s %36s %s \n" "Key to drive status symbols:  * spinning;  _ standby;  ? unknown" "Version" "$VERSION"
+printf "\n%s %3s %s \n" "Key to drive status symbols:  * spinning (*-- without a temperature);  _ standby;  ? not readable" "Version" "$VERSION"
 print_header
 
 ###########################################
@@ -107,7 +105,19 @@ while true ; do
    get_cpu_temp
 
    printf "^%-3s %5s" "${Tmax:---}" "${Tmean:----}"
-   printf "%6s %3s %5s %5s %5s %5s %5s %5s %5s %5s %5s %-7s" "${ERRc:----}" "${CPU_TEMP:----}" "${FAN1:----}" "${FAN2:----}" "${FAN3:----}" "${FAN4:----}" "${FAN5:----}" "${FANA:----}" "${FANB:----}" "${DUTY0:----}" "${DUTY1:----}" "$MODEt"
+   printf "%6s %3s %5s %5s %5s %5s %5s %5s %5s %5s %5s %-7s" "${ERRc:----}" "${CPU_TEMP:----}" "${FAN1:----}" "${FAN2:----}" "${FAN3:----}" "${FAN4:----}" "${FAN5:----}" "${FANA:----}" "${FANB:----}" "${DUTY0:----}" "${DUTY1:----}" "${MODEt:----}"
+
+   # The mode and duty reads drop ipmitool's error text; each raw command that stops answering is
+   # noted once, by the column it feeds.
+   for v in MODE DUTY0 DUTY1; do
+      noted=NOTED_$v
+      if [ -z "${!v}" ]; then
+         [ "${!noted}" == 1 ] || printf "\n%s" "No answer to the raw command behind the ${v/DUTY/Fan%} column; --- until it answers"
+         printf -v "$noted" 1
+      else
+         printf -v "$noted" 0
+      fi
+   done
 
    sleep $(( T * 60 ))
 done

@@ -3,7 +3,7 @@
 # Step both fan zones from DUTY_START down to DUTY_STOP, logging every fan's RPM at each step, to
 # find the RPM/duty relation and stall point of each fan. Run as superuser with no fan control
 # script running.
-VERSION="2026-10-17"
+VERSION="2026-10-20"
 
 #################  SETTINGS  ################
 
@@ -24,13 +24,11 @@ DUTY_STOP=20
 DIR=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
 # shellcheck source=spincommon.sh
 source "$DIR/spincommon.sh" || { echo "cannot read $DIR/spincommon.sh" >&2; exit 1; }
-setup_logging
 require_settings IPMITOOL DUTY_START DUTY_STOP
 require_tools IPMITOOL
-if [[ ! $DUTY_START =~ ^[0-9]+$ || ! $DUTY_STOP =~ ^[0-9]+$ || $DUTY_START -gt 100 || $DUTY_STOP -gt $DUTY_START || $DUTY_STOP -lt 10 ]]; then
-   echo "DUTY_START and DUTY_STOP must be whole numbers with 100 >= DUTY_START >= DUTY_STOP >= 10"
-   exit 1
-fi
+require_integers 10 100 DUTY_START DUTY_STOP
+(( DUTY_STOP <= DUTY_START )) || fail "DUTY_STOP must not be above DUTY_START; check the settings at the top of the script"
+setup_logging
 
 # Table header with a timestamp; printed before and after the confirmation.
 print_header() {
@@ -50,13 +48,18 @@ read_fan_data() {
 
 # One table row labelled COND: mode, both duties, the seven fan RPMs.
 print_line() {
-   printf "%-23s %-8s %5s %5s %5s %5s %5s %5s %5s %5s %5s \n" "$COND" "$MODEt" "${DUTY_0:----}" "${DUTY_1:----}" "${FANA:----}" "${FANB:----}" "${FAN1:----}" "${FAN2:----}" "${FAN3:----}" "${FAN4:----}" "${FAN5:----}"
+   printf "%-23s %-8s %5s %5s %5s %5s %5s %5s %5s %5s %5s \n" "$COND" "${MODEt:----}" "${DUTY_0:----}" "${DUTY_1:----}" "${FANA:----}" "${FANB:----}" "${FAN1:----}" "${FAN2:----}" "${FAN3:----}" "${FAN4:----}" "${FAN5:----}"
 }
 
 #####################################################
 # Main section
 #####################################################
 read_fan_data
+# Without the current mode and zone 0 duty there is nothing to restore the board to afterwards.
+if [ -z "$MODE" ] || [ -z "$DUTY_0" ]; then
+   echo "Cannot read the fan mode or the zone 0 duty from the BMC; not started."
+   exit 1
+fi
 MODEorig=$MODE
 DUTY_0orig=$DUTY_0
 DUTY_1orig=$DUTY_1
@@ -103,7 +106,9 @@ while :; do
    (( i < DUTY_STOP )) && i=$DUTY_STOP
 done
 
-# Restore the pre-test duties and mode.
+# Restore the pre-test mode, then the duties: selecting Full mode can put both zones at 100 %.
+set_mode "${MODEorig:-1}"
+sleep 1
 if [ -n "$DUTY_0orig" ]; then
    set_duty 0 "$DUTY_0orig"
    sleep 1
@@ -111,8 +116,9 @@ fi
 if [ -n "$DUTY_1orig" ]; then
    set_duty 1 "$DUTY_1orig"
    sleep 1
+else
+   echo "Zone 1 duty was not readable before the test and is not restored; see the row below"
 fi
-set_mode "${MODEorig:-1}"
 sleep 5
 read_fan_data
 COND="After test (restored)"
