@@ -1,4 +1,4 @@
-#!/usr/local/bin/bash
+#!/usr/bin/env bash
 
 # Fan control for Supermicro boards with two fan zones: a PD controller holds the mean drive
 # temperature at a setpoint with the peripheral zone; the CPU zone follows the CPU temperature.

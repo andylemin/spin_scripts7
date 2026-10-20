@@ -1,4 +1,4 @@
-#!/usr/local/bin/bash
+#!/usr/bin/env bash
 
 # Fan control for Supermicro boards with one fan zone: the zone runs at the higher of the drive
 # demand (a PD controller holding the mean drive temperature at a setpoint) and the CPU demand.

@@ -1,4 +1,4 @@
-#!/usr/local/bin/bash
+#!/usr/bin/env bash
 
 # Step both fan zones from DUTY_START down to DUTY_STOP, logging every fan's RPM at each step, to
 # find the RPM/duty relation and stall point of each fan. Run as superuser with no fan control

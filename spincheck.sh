@@ -1,4 +1,4 @@
-#!/usr/local/bin/bash
+#!/usr/bin/env bash
 
 # Log drive temperatures, fan RPMs, duty cycles and the fan mode at a fixed interval without
 # controlling anything; one or two fan zones. Run as superuser.

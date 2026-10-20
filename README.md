@@ -22,7 +22,7 @@ This fork adds support for boards with seven fan headers (FAN1-FAN5, FANA, FANB)
 
 ## Requirements
 
-- FreeBSD 13 or 14 (TrueNAS CORE) with `bash` from ports at `/usr/local/bin/bash`.
+- FreeBSD 13 or later (TrueNAS CORE) with `bash` 5 from ports on the PATH; the scripts start with `#!/usr/bin/env bash`.
 - `ipmitool` (ports) with access to the board's BMC, `smartctl` from smartmontools, and `camcontrol` from the base system. `hdd-temp.sh` also uses `nvmecontrol`.
 - Root privileges.
 - A fan on header FAN1 and, for the dual-zone controller, on FANA: these are the reference fans whose RPM is checked against the duty.
@@ -158,6 +158,10 @@ The `.config` files are plain settings now; the logging redirection and the hook
 ## Changes since the fork
 
 Upstream on GitHub stopped at Glorious1's 2018 upload; his later releases were published on the TrueNAS forum resource, the last being 2020-08-20. The scripts print their version (a date) at startup.
+
+### 2026-10-20
+
+- The bash scripts start with `#!/usr/bin/env bash`, so they run wherever bash is on the PATH instead of requiring `/usr/local/bin/bash`.
 
 ### 2026-10-17
 
