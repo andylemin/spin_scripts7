@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
 # Fan control for Supermicro boards with one fan zone: the zone runs at the higher of the drive
-# demand (a PD controller holding the mean drive temperature at a setpoint) and the CPU demand.
+# demand (a feedback loop, Glorious1's P and D terms added to the previous duty, holding the mean
+# drive temperature at a setpoint) and the CPU demand.
 # Run as superuser; settings in spinpid.config.
 VERSION="2026-10-20"
 

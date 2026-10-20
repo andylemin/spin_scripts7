@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
-# Fan control for Supermicro boards with two fan zones: a PD controller holds the mean drive
-# temperature at a setpoint with the peripheral zone; the CPU zone follows the CPU temperature.
+# Fan control for Supermicro boards with two fan zones: a feedback loop (Glorious1's P and D terms,
+# added to the previous duty) holds the mean drive temperature at a setpoint with the peripheral
+# zone; the CPU zone follows the CPU temperature.
 # Run as superuser; settings in spinpid2.config.
 VERSION="2026-10-20"
 
